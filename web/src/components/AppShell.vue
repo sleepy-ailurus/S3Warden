@@ -4,14 +4,18 @@ import { useMessage } from "naive-ui";
 import TopBar from "./TopBar.vue";
 import ConnectionSidebar from "./ConnectionSidebar.vue";
 import ConnectionModal from "./ConnectionModal.vue";
+import TransferPanel from "./TransferPanel.vue";
 import BrowserView from "../views/BrowserView.vue";
 import { useConnectionStore } from "../stores/connections";
+import { useTransferStore } from "../stores/transfers";
 import { errText } from "../utils/format";
 
 const store = useConnectionStore();
+const transfers = useTransferStore();
 const message = useMessage();
 
 onMounted(async () => {
+  void transfers.init();
   try {
     await store.loadPresets();
     await store.refreshProfiles();
@@ -33,6 +37,7 @@ onMounted(async () => {
       </main>
     </div>
     <ConnectionModal />
+    <TransferPanel />
   </div>
 </template>
 

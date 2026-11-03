@@ -108,24 +108,21 @@ const metaRows = computed(() => {
   return rows;
 });
 
-// ---- 下载 ----
+// ---- 下载（入传输队列，进度见传输面板）----
 async function download() {
   const dest = await save({
     defaultPath: displayName.value,
     title: "下载到…",
   });
   if (!dest) return;
-  acting.value = true;
   try {
-    const r = unwrap(
-      await commands.downloadObject(connId.value, bucket.value, key.value, dest),
+    unwrap(
+      await commands.startDownload(connId.value, bucket.value, key.value, dest),
     );
-    message.success(`已下载 ${formatSize(r.size)}`);
-    lastDownloadPath.value = r.path;
+    lastDownloadPath.value = dest;
+    message.success("已加入下载队列，可在右下角传输面板查看进度");
   } catch (e) {
     message.error(errText(e));
-  } finally {
-    acting.value = false;
   }
 }
 

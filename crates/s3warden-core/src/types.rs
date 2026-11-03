@@ -150,6 +150,12 @@ pub struct ConnectionProfile {
     pub backend: Option<BackendKind>,
     /// 是否默认连接。
     pub is_default: bool,
+    /// 跳过 TLS 证书校验（自签证书场景，CONN-15）。
+    #[serde(default)]
+    pub insecure_skip_tls_verify: bool,
+    /// 自定义 CA 证书文件路径（PEM，可选）。
+    #[serde(default)]
+    pub custom_ca_path: Option<String>,
     /// 创建时间（RFC3339）。
     pub created_at: String,
     /// 更新时间（RFC3339）。
@@ -174,6 +180,10 @@ pub struct ConnectionInput {
     pub preset: Option<BackendPreset>,
     /// 是否 path-style 寻址；None 表示按接入类型取默认。
     pub path_style: Option<bool>,
+    /// 跳过 TLS 证书校验（自签证书场景）。
+    pub insecure_skip_tls_verify: Option<bool>,
+    /// 自定义 CA 证书文件路径（PEM，可选）。
+    pub custom_ca_path: Option<String>,
 }
 
 /// 更新连接的可选字段。
@@ -194,6 +204,10 @@ pub struct ConnectionPatch {
     pub preset: Option<BackendPreset>,
     /// 是否 path-style 寻址。
     pub path_style: Option<bool>,
+    /// 跳过 TLS 证书校验（None 表示不修改）。
+    pub insecure_skip_tls_verify: Option<bool>,
+    /// 自定义 CA 证书文件路径；空字符串表示清除。
+    pub custom_ca_path: Option<String>,
 }
 
 /// 密钥状态（脱敏，开发文档 6.4）。
@@ -398,6 +412,31 @@ pub struct ObjectPage {
     pub entries: Vec<ObjectEntry>,
     /// 下一页 continuation token（None 表示已到末页）。
     pub next_token: Option<String>,
+}
+
+/// 传输任务的待上传文件计划（壳层据此创建传输任务）。
+#[derive(Debug, Clone, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct PlannedUpload {
+    /// 本地文件绝对路径。
+    pub local_path: String,
+    /// 目标对象 key（含前缀与目录结构）。
+    pub key: String,
+    /// 文件大小（字节）。
+    #[specta(type = f64)]
+    pub size: u64,
+}
+
+/// 批量删除结果。
+#[derive(Debug, Clone, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchDeleteResult {
+    /// 实际尝试删除的对象数（目录会先展开为其下全部对象）。
+    pub requested: u32,
+    /// 服务端确认删除数。
+    pub deleted: u32,
+    /// 失败明细（`key：原因`）。
+    pub errors: Vec<String>,
 }
 
 /// 后端能力集合（开发文档 2.5 能力开关）。

@@ -32,6 +32,10 @@ pub enum AppError {
     /// 目标资源不存在。
     #[error("资源不存在：{0}")]
     NotFound(String),
+
+    /// 用户主动取消（传输任务等）。
+    #[error("操作已取消")]
+    Cancelled,
 }
 
 /// 统一结果类型。

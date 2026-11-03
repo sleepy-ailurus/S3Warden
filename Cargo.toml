@@ -34,6 +34,11 @@ tauri-plugin-opener = "2"
 # S3 客户端与探测
 aws-sdk-s3 = "1"
 aws-smithy-types = "1"
+# 自定义 TLS 客户端（自签证书 / 自定义 CA，CONN-15）：与 SDK 默认 hyper 0.14 栈同源
+aws-smithy-http-client = { version = "1", default-features = false, features = ["hyper-014", "legacy-rustls-ring"] }
+rustls = { version = "0.21", features = ["dangerous_configuration"] }
+rustls-pemfile = "1"
+hyper-rustls = { version = "0.24", features = ["http2"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "webpki-roots"] }
 
 # 本地能力

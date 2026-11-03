@@ -3,6 +3,7 @@ import { computed, ref, watch } from "vue";
 import {
   NAlert,
   NButton,
+  NCheckbox,
   NForm,
   NFormItem,
   NInput,
@@ -16,6 +17,7 @@ import {
   useMessage,
 } from "naive-ui";
 import type { SelectOption } from "naive-ui";
+import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { commands } from "../bindings";
 import type { BackendPreset, ConnectionTestOk } from "../bindings";
 import { useConnectionStore } from "../stores/connections";
@@ -44,6 +46,8 @@ const region = ref("");
 const accessKey = ref("");
 const secretKey = ref("");
 const pathStyle = ref(true);
+const insecureSkipVerify = ref(false);
+const customCaPath = ref("");
 
 /** 后端接入类型下拉项（数据来自 Rust 侧单一数据源）。 */
 const presetOptions = computed<SelectOption[]>(() =>
@@ -103,8 +107,21 @@ watch(show, (v) => {
   secretLoaded.value = false;
   if (p) void loadSecret(p.id);
   pathStyle.value = p?.pathStyle ?? true;
+  insecureSkipVerify.value = p?.insecureSkipTlsVerify ?? false;
+  customCaPath.value = p?.customCaPath ?? "";
   testResult.value = null;
 });
+
+/** 选择自定义 CA 证书文件（PEM）。 */
+async function pickCaFile() {
+  const picked = await openDialog({
+    multiple: false,
+    directory: false,
+    title: "选择 CA 证书文件（PEM）",
+  });
+  if (!picked || Array.isArray(picked)) return;
+  customCaPath.value = picked;
+}
 
 // ---- 端点自动补 scheme ----
 /** 未写 scheme 时默认补 `http://`（用户写 https:// 则保留）。 */
@@ -148,6 +165,8 @@ async function runTest() {
           secretKey: secretKey.value,
           preset: preset.value,
           pathStyle: pathStyle.value,
+          insecureSkipTlsVerify: insecureSkipVerify.value,
+          customCaPath: customCaPath.value.trim() || null,
         }),
       );
     }
@@ -176,6 +195,8 @@ async function save() {
           secretKey: secretKey.value || null,
           preset: preset.value,
           pathStyle: pathStyle.value,
+          insecureSkipTlsVerify: insecureSkipVerify.value,
+          customCaPath: customCaPath.value,
         }),
       );
       message.success("连接已更新");
@@ -189,6 +210,8 @@ async function save() {
           secretKey: secretKey.value,
           preset: preset.value,
           pathStyle: pathStyle.value,
+          insecureSkipTlsVerify: insecureSkipVerify.value,
+          customCaPath: customCaPath.value.trim() || null,
         }),
       );
       message.success(
@@ -288,6 +311,24 @@ function removeConnection() {
           <NRadio :value="false">Virtual-Host</NRadio>
         </NRadioGroup>
       </NFormItem>
+      <NFormItem label="TLS 证书">
+        <div class="tls-block">
+          <NCheckbox v-model:checked="insecureSkipVerify">
+            接受自签 / 无效证书（不校验，仅供可信内网使用）
+          </NCheckbox>
+          <div class="ca-row">
+            <NInput
+              v-model:value="customCaPath"
+              size="small"
+              placeholder="自定义 CA 证书路径（PEM，可选）"
+            />
+            <NButton size="small" @click="pickCaFile()">选择文件</NButton>
+          </div>
+          <NText depth="3" style="font-size: 12px">
+            自签 HTTPS 端点二选一：勾选跳过校验，或提供签发方的 CA 证书。
+          </NText>
+        </div>
+      </NFormItem>
     </NForm>
 
     <NSpace vertical :size="10">
@@ -324,5 +365,17 @@ function removeConnection() {
   display: flex;
   justify-content: space-between;
   align-items: center;
+}
+
+.tls-block {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  width: 100%;
+}
+
+.ca-row {
+  display: flex;
+  gap: 8px;
 }
 </style>

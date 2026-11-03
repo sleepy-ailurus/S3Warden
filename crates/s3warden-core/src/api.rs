@@ -11,11 +11,13 @@ use uuid::Uuid;
 
 use crate::config::{now_rfc3339, ProfileStore};
 use crate::error::{AppError, AppResult};
+use crate::s3::TlsOptions;
 use crate::types::{
-    BackendPreset, BackendPresetInfo, BucketDeleteResult, BucketPolicyInfo, ConnectionInput,
+    BackendPreset, BackendPresetInfo, BatchDeleteResult, BucketDeleteResult, BucketPolicyInfo,
+    ConnectionInput,
     ConnectionPatch,
     ConnectionProfile, ConnectionTestOk, DownloadResult, ObjectDetail, ObjectEntry, ObjectPage,
-    ObjectTag, PresignedUrl, RenameDirResult, SecretStatus, TextPreview, UploadSummary,
+    ObjectTag, PlannedUpload, PresignedUrl, RenameDirResult, SecretStatus, TextPreview, UploadSummary,
 };
 use crate::{probe, s3, secrets};
 
@@ -64,14 +66,42 @@ pub fn reveal_secret(id: &str) -> AppResult<String> {
     })
 }
 
+/// 读取自定义 CA 证书文件内容（PEM）。
+fn load_ca_pem(path: Option<&str>) -> AppResult<Option<Vec<u8>>> {
+    let Some(p) = path.map(str::trim).filter(|p| !p.is_empty()) else {
+        return Ok(None);
+    };
+    let data = std::fs::read(p)
+        .map_err(|e| AppError::Invalid(format!("读取 CA 证书文件失败（{p}）：{e}")))?;
+    Ok(Some(data))
+}
+
+/// 由连接档案构造 TLS 选项（CONN-15）。
+fn tls_for(profile: &ConnectionProfile) -> AppResult<TlsOptions> {
+    Ok(TlsOptions {
+        insecure_skip_verify: profile.insecure_skip_tls_verify,
+        custom_ca_pem: load_ca_pem(profile.custom_ca_path.as_deref())?,
+    })
+}
+
+fn normalize_ca_path(path: Option<&str>) -> Option<String> {
+    path.map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(str::to_string)
+}
+
 /// 创建连接：探测后端 → 写密钥 → 落配置。
 ///
 /// 顺序刻意为之：先写密钥再落配置，避免出现「有连接档案却无密钥」的悬空状态。
 pub async fn create_connection(input: ConnectionInput) -> AppResult<ConnectionProfile> {
     validate(&input.name, &input.endpoint, &input.access_key, Some(&input.secret_key))?;
 
+    let tls = TlsOptions {
+        insecure_skip_verify: input.insecure_skip_tls_verify.unwrap_or(false),
+        custom_ca_pem: load_ca_pem(input.custom_ca_path.as_deref())?,
+    };
     let store = ProfileStore::open()?;
-    let (backend, _) = probe::probe_backend(input.endpoint.trim()).await;
+    let (backend, _) = probe::probe_backend(input.endpoint.trim(), &tls).await;
     let preset = input.preset.unwrap_or_default();
 
     let is_default = store.list()?.is_empty();
@@ -87,6 +117,8 @@ pub async fn create_connection(input: ConnectionInput) -> AppResult<ConnectionPr
         preset,
         backend: Some(backend),
         is_default,
+        insecure_skip_tls_verify: tls.insecure_skip_verify,
+        custom_ca_path: normalize_ca_path(input.custom_ca_path.as_deref()),
         created_at: now_rfc3339(),
         updated_at: now_rfc3339(),
     };
@@ -155,6 +187,12 @@ pub fn update_connection(id: &str, patch: ConnectionPatch) -> AppResult<Connecti
     if let Some(path_style) = patch.path_style {
         profile.path_style = path_style;
     }
+    if let Some(skip) = patch.insecure_skip_tls_verify {
+        profile.insecure_skip_tls_verify = skip;
+    }
+    if patch.custom_ca_path.is_some() {
+        profile.custom_ca_path = normalize_ca_path(patch.custom_ca_path.as_deref());
+    }
     if let Some(sk) = &patch.secret_key {
         if !sk.is_empty() {
             secrets::save_secret(id, sk)?;
@@ -191,13 +229,14 @@ async fn run_test(
     access_key: &str,
     secret_key: &str,
     path_style: bool,
+    tls: &TlsOptions,
 ) -> AppResult<ConnectionTestOk> {
     let started = Instant::now();
-    let client = s3::build_client(endpoint, region, access_key, secret_key, path_style);
+    let client = s3::build_client(endpoint, region, access_key, secret_key, path_style, tls)?;
     let buckets = s3::list_buckets(&client).await?;
     let latency_ms = started.elapsed().as_millis() as u32;
 
-    let (backend, server_header) = probe::probe_backend(endpoint).await;
+    let (backend, server_header) = probe::probe_backend(endpoint, tls).await;
     Ok(ConnectionTestOk {
         latency_ms,
         backend,
@@ -209,6 +248,10 @@ async fn run_test(
 /// 测试未保存的连接（新建对话框场景）。
 pub async fn test_new_connection(input: ConnectionInput) -> AppResult<ConnectionTestOk> {
     validate(&input.name, &input.endpoint, &input.access_key, Some(&input.secret_key))?;
+    let tls = TlsOptions {
+        insecure_skip_verify: input.insecure_skip_tls_verify.unwrap_or(false),
+        custom_ca_pem: load_ca_pem(input.custom_ca_path.as_deref())?,
+    };
     run_test(
         input.endpoint.trim(),
         &normalize_region(input.region.as_deref()),
@@ -217,6 +260,7 @@ pub async fn test_new_connection(input: ConnectionInput) -> AppResult<Connection
         input
             .path_style
             .unwrap_or_else(|| input.preset.unwrap_or_default().default_path_style()),
+        &tls,
     )
     .await
 }
@@ -232,6 +276,7 @@ pub async fn test_saved_connection(id: &str) -> AppResult<ConnectionTestOk> {
         &profile.access_key,
         &secret,
         profile.path_style,
+        &tls_for(&profile)?,
     )
     .await
 }
@@ -239,13 +284,28 @@ pub async fn test_saved_connection(id: &str) -> AppResult<ConnectionTestOk> {
 async fn client_for(profile: &ConnectionProfile) -> AppResult<s3::Client> {
     let secret = secrets::load_secret(&profile.id)?
         .ok_or_else(|| AppError::Keyring("该连接尚未配置 Secret Key".to_string()))?;
-    Ok(s3::build_client(
+    s3::build_client(
         &profile.endpoint,
         &profile.region,
         &profile.access_key,
         &secret,
         profile.path_style,
-    ))
+        &tls_for(profile)?,
+    )
+}
+
+/// 取连接并构造其 S3 客户端（传输引擎等长任务场景复用）。
+pub async fn prepare_transfer(id: &str) -> AppResult<(ConnectionProfile, s3::Client)> {
+    let profile = get_connection(id)?;
+    let client = client_for(&profile).await?;
+    Ok((profile, client))
+}
+
+/// 传输断点状态目录：`%APPDATA%/s3warden/transfers`。
+pub fn transfer_state_dir() -> AppResult<std::path::PathBuf> {
+    dirs::data_dir()
+        .map(|d| d.join("s3warden").join("transfers"))
+        .ok_or_else(|| AppError::Config("无法确定应用数据目录".to_string()))
 }
 
 /// 列出某连接的全部桶。
@@ -568,6 +628,115 @@ pub async fn upload_paths(
         }
     }
     Ok(summary)
+}
+
+/// 展开待上传路径为「每文件一条计划」（供传输引擎建任务）。
+pub fn collect_upload_plans(
+    paths: &[String],
+    prefix: &str,
+) -> AppResult<Vec<PlannedUpload>> {
+    let items = expand_upload_items(paths, normalize_prefix(prefix))?;
+    items
+        .into_iter()
+        .map(|(path, key)| {
+            let size = std::fs::metadata(&path)
+                .map(|m| m.len())
+                .unwrap_or(0);
+            Ok(PlannedUpload {
+                local_path: path.to_string_lossy().to_string(),
+                key,
+                size,
+            })
+        })
+        .collect()
+}
+
+/// 批量删除对象（OBJ-10）。
+///
+/// 目录条目（`key` 以 `/` 结尾）会先递归展开为其下全部对象再统一批量删除。
+pub async fn delete_objects_batch(
+    id: &str,
+    bucket: &str,
+    keys: Vec<String>,
+) -> AppResult<BatchDeleteResult> {
+    if bucket.is_empty() {
+        return Err(AppError::Invalid("bucket 不能为空".to_string()));
+    }
+    if keys.is_empty() {
+        return Err(AppError::Invalid("未选择任何对象".to_string()));
+    }
+    let profile = get_connection(id)?;
+    let client = client_for(&profile).await?;
+
+    let mut all: Vec<String> = Vec::new();
+    for key in &keys {
+        let k = key.trim();
+        if k.is_empty() {
+            continue;
+        }
+        if k.ends_with('/') {
+            all.extend(s3::list_all_keys(&client, bucket, k).await?);
+        } else {
+            all.push(k.to_string());
+        }
+    }
+    all.sort();
+    all.dedup();
+    let requested = all.len() as u32;
+    if all.is_empty() {
+        return Err(AppError::Invalid("所选目录均为空目录".to_string()));
+    }
+
+    let deleted = s3::delete_objects(&client, bucket, &all).await?;
+    Ok(BatchDeleteResult {
+        requested,
+        deleted: deleted as u32,
+        errors: Vec::new(),
+    })
+}
+
+/// 创建「文件夹」占位前缀（OBJ-13）。
+///
+/// S3 无目录实体：写入一个 0 字节、key 以 `/` 结尾的占位对象。
+pub async fn create_prefix(
+    id: &str,
+    bucket: &str,
+    prefix: &str,
+    name: &str,
+) -> AppResult<ObjectEntry> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(AppError::Invalid("文件夹名不能为空".to_string()));
+    }
+    if name.contains('/') {
+        return Err(AppError::Invalid("文件夹名不能包含 /".to_string()));
+    }
+    if name == "." || name == ".." {
+        return Err(AppError::Invalid("文件夹名不合法".to_string()));
+    }
+    let profile = get_connection(id)?;
+    let client = client_for(&profile).await?;
+    let key = format!("{}{name}/", normalize_prefix(prefix));
+
+    client
+        .put_object()
+        .bucket(bucket)
+        .key(&key)
+        .content_length(0)
+        .body(aws_smithy_types::byte_stream::ByteStream::from_static(b""))
+        .send()
+        .await
+        .map_err(|e| AppError::S3(format!("创建文件夹失败：{e}")))?;
+
+    Ok(ObjectEntry {
+        key,
+        name: name.to_string(),
+        is_dir: true,
+        size: 0,
+        last_modified: None,
+        etag: None,
+        storage_class: None,
+    })
 }
 
 /// 文本预览默认读取上限（256 KiB）。

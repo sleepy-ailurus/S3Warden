@@ -141,6 +141,8 @@ mod tests {
             preset: BackendPreset::Minio,
             backend: Some(BackendKind::Minio),
             is_default: false,
+            insecure_skip_tls_verify: false,
+            custom_ca_path: None,
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
         }

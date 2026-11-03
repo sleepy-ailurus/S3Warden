@@ -3,6 +3,7 @@
 //! 仅使用高层 S3 API；跨后端差异（MinIO / RustFS / Generic）由统一的客户端构造参数吸收。
 
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
@@ -31,15 +32,29 @@ const DELETE_BATCH_SIZE: usize = 1000;
 /// S3 请求超时（秒）。
 pub const REQUEST_TIMEOUT_SECS: u64 = 20;
 
+/// TLS 定制选项（自签证书 / 自定义 CA，CONN-15）。
+#[derive(Debug, Clone, Default)]
+pub struct TlsOptions {
+    /// 跳过证书校验（信任任何证书，包括自签）。
+    ///
+    /// 两个开关同时设置时本项优先。
+    pub insecure_skip_verify: bool,
+    /// 自定义 CA 证书的 PEM 内容（校验链以此为准）。
+    pub custom_ca_pem: Option<Vec<u8>>,
+}
+
 /// 构造 S3 客户端（显式凭据 + 端点覆盖，不读取环境默认链）。
+///
+/// 未启用任何 TLS 定制时走 SDK 默认 HTTP 客户端；否则构造自定义 rustls 客户端。
 pub fn build_client(
     endpoint: &str,
     region: &str,
     access_key: &str,
     secret_key: &str,
     path_style: bool,
-) -> Client {
-    let config = aws_sdk_s3::Config::builder()
+    tls: &TlsOptions,
+) -> AppResult<Client> {
+    let mut builder = aws_sdk_s3::Config::builder()
         .behavior_version(BehaviorVersion::latest())
         .credentials_provider(Credentials::new(
             access_key,
@@ -50,9 +65,104 @@ pub fn build_client(
         ))
         .endpoint_url(endpoint)
         .region(Region::new(region.to_string()))
-        .force_path_style(path_style)
-        .build();
-    Client::from_conf(config)
+        .force_path_style(path_style);
+
+    if tls.insecure_skip_verify || tls.custom_ca_pem.is_some() {
+        let config = build_tls_config(tls)?;
+        let connector = hyper_rustls::HttpsConnectorBuilder::new()
+            .with_tls_config(config)
+            .https_or_http()
+            .enable_http1()
+            .enable_http2()
+            .build();
+        builder = builder.http_client(
+            aws_smithy_http_client::hyper_014::HyperClientBuilder::new().build(connector),
+        );
+    }
+
+    Ok(Client::from_conf(builder.build()))
+}
+
+/// 接受任何服务端证书的校验器（rustls 无 `danger_accept_invalid_certs` 等价物）。
+///
+/// 仅在用户显式勾选「跳过证书校验」时启用；自签 MinIO 的标准做法。
+#[derive(Debug)]
+struct AcceptAnyServerCert;
+
+impl rustls::client::ServerCertVerifier for AcceptAnyServerCert {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::Certificate,
+        _intermediates: &[rustls::Certificate],
+        _server_name: &rustls::ServerName,
+        _scts: &mut dyn Iterator<Item = &[u8]>,
+        _ocsp_response: &[u8],
+        _now: std::time::SystemTime,
+    ) -> Result<rustls::client::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::Certificate,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::Certificate,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        vec![
+            rustls::SignatureScheme::RSA_PKCS1_SHA256,
+            rustls::SignatureScheme::RSA_PKCS1_SHA384,
+            rustls::SignatureScheme::RSA_PKCS1_SHA512,
+            rustls::SignatureScheme::RSA_PSS_SHA256,
+            rustls::SignatureScheme::RSA_PSS_SHA384,
+            rustls::SignatureScheme::RSA_PSS_SHA512,
+            rustls::SignatureScheme::ED25519,
+            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+            rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
+        ]
+    }
+}
+
+/// 构造自定义 rustls TLS 配置（跳过校验或以自定义 CA 为信任根）。
+fn build_tls_config(tls: &TlsOptions) -> AppResult<rustls::ClientConfig> {
+    let config = if tls.insecure_skip_verify {
+        rustls::ClientConfig::builder()
+            .with_safe_defaults()
+            .with_custom_certificate_verifier(Arc::new(AcceptAnyServerCert))
+            .with_no_client_auth()
+    } else {
+        let pem = tls.custom_ca_pem.as_deref().ok_or_else(|| {
+            AppError::Invalid("未提供自定义 CA 证书内容".to_string())
+        })?;
+        let mut roots = rustls::RootCertStore::empty();
+        let mut cursor = std::io::BufReader::new(pem);
+        let certs =
+            rustls_pemfile::certs(&mut cursor).map_err(|e| {
+                AppError::Invalid(format!("解析 CA 证书失败：{e}"))
+            })?;
+        for der in certs {
+            roots
+                .add(&rustls::Certificate(der))
+                .map_err(|e| AppError::Invalid(format!("加载 CA 证书失败：{e}")))?;
+        }
+        rustls::ClientConfig::builder()
+            .with_safe_defaults()
+            .with_root_certificates(roots)
+            .with_no_client_auth()
+    };
+    Ok(config)
 }
 
 fn rfc3339(dt: Option<&aws_smithy_types::DateTime>) -> Option<String> {

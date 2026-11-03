@@ -5,8 +5,8 @@
 use s3warden_core::api;
 use s3warden_core::error::AppError;
 use s3warden_core::types::{
-    BackendPresetInfo, BucketDeleteResult, BucketPolicyInfo, BucketSummary, ConnectionInput,
-    ConnectionPatch,
+    BackendPresetInfo, BatchDeleteResult, BucketDeleteResult, BucketPolicyInfo, BucketSummary,
+    ConnectionInput, ConnectionPatch,
     ConnectionProfile, ConnectionTestOk, DownloadResult, ObjectDetail, ObjectEntry, ObjectPage,
     ObjectTag, PresignedUrl, RenameDirResult, SecretStatus, TextPreview, UploadSummary,
 };
@@ -240,4 +240,27 @@ pub async fn upload_paths(
     paths: Vec<String>,
 ) -> Result<UploadSummary, AppError> {
     api::upload_paths(&id, &bucket, &prefix, paths).await
+}
+
+/// 创建「文件夹」占位前缀（OBJ-13）。
+#[tauri::command]
+#[specta::specta]
+pub async fn create_prefix(
+    id: String,
+    bucket: String,
+    prefix: String,
+    name: String,
+) -> Result<ObjectEntry, AppError> {
+    api::create_prefix(&id, &bucket, &prefix, &name).await
+}
+
+/// 批量删除对象（目录自动展开为其下全部对象；OBJ-10）。
+#[tauri::command]
+#[specta::specta]
+pub async fn delete_objects_batch(
+    id: String,
+    bucket: String,
+    keys: Vec<String>,
+) -> Result<BatchDeleteResult, AppError> {
+    api::delete_objects_batch(&id, &bucket, keys).await
 }

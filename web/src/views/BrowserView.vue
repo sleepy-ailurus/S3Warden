@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, h, ref } from "vue";
+import { computed, h, onMounted, onUnmounted, ref, watch } from "vue";
 import {
   NButton,
   NDataTable,
@@ -10,6 +10,7 @@ import {
   useMessage,
 } from "naive-ui";
 import type { DataTableColumns } from "naive-ui";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
 import {
   AddOutline,
   ArrowBackOutline,
@@ -31,6 +32,7 @@ import { ask, open, save } from "@tauri-apps/plugin-dialog";
 import { commands } from "../bindings";
 import type { BucketSummary, ObjectEntry } from "../bindings";
 import { useConnectionStore } from "../stores/connections";
+import { useTransferStore } from "../stores/transfers";
 import { errText, formatSize, formatTime } from "../utils/format";
 import { unwrap } from "../utils/ipc";
 import BucketAccessModal from "../components/BucketAccessModal.vue";
@@ -40,12 +42,12 @@ import ObjectDetailPanel from "../components/ObjectDetailPanel.vue";
 import PromptModal from "../components/PromptModal.vue";
 
 const store = useConnectionStore();
+const transfers = useTransferStore();
 const message = useMessage();
 
 /** 文件统一用中性色文件图标，不按扩展名着色。 */
 const FILE_ICON_COLOR = "#8a9099";
 
-const uploading = ref(false);
 const uploadHint = ref<string | null>(null);
 
 // ---- 桶列表 ----
@@ -206,16 +208,14 @@ async function submitRenameDir(newName: string) {
   }
 }
 
-/** 右键 → 下载：直接选保存路径，走 Rust 流式写盘。 */
+/** 右键 → 下载：选保存路径后入传输队列（进度见右下角传输面板）。 */
 async function quickDownload(row: ObjectEntry) {
   if (!store.activeId || !store.currentBucket) return;
   const dest = await save({ defaultPath: row.name, title: "下载到…" });
   if (!dest) return;
   try {
-    const r = unwrap(
-      await commands.downloadObject(store.activeId, store.currentBucket, row.key, dest),
-    );
-    message.success(`已下载 ${formatSize(r.size)}`);
+    await transfers.startDownload(store.activeId, store.currentBucket, row.key, dest);
+    message.success("已加入下载队列");
   } catch (e) {
     message.error(errText(e));
   }
@@ -284,10 +284,19 @@ const bucketRowProps = (row: BucketSummary) => ({
 });
 
 // ---- 对象浏览 ----
+// 目录恒排最前，其余按当前列排序（客户端排序，作用于已加载条目）。
+function dirFirst(a: ObjectEntry, b: ObjectEntry, cmp: () => number) {
+  if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
+  return cmp();
+}
+
 const objectColumns: DataTableColumns<ObjectEntry> = [
+  { type: "selection" },
   {
     title: "名称",
     key: "name",
+    sorter: (a, b) =>
+      dirFirst(a, b, () => a.name.toLowerCase().localeCompare(b.name.toLowerCase())),
     render: (row) =>
       row.isDir
         ? h(
@@ -318,12 +327,17 @@ const objectColumns: DataTableColumns<ObjectEntry> = [
     title: "大小",
     key: "size",
     width: 110,
+    sorter: (a, b) => dirFirst(a, b, () => (a.size ?? 0) - (b.size ?? 0)),
     render: (row) => (row.isDir ? "—" : formatSize(row.size)),
   },
   {
     title: "最后修改",
     key: "lastModified",
     width: 190,
+    sorter: (a, b) =>
+      dirFirst(a, b, () =>
+        (a.lastModified ?? "").localeCompare(b.lastModified ?? ""),
+      ),
     render: (row) => formatTime(row.lastModified),
   },
 ];
@@ -331,8 +345,128 @@ const objectColumns: DataTableColumns<ObjectEntry> = [
 const objectRowProps = (row: ObjectEntry) => ({
   style: "cursor: pointer;",
   class: store.selected?.key === row.key ? "row-active" : "",
-  onClick: () => (row.isDir ? store.enterDir(row.key) : store.selectObject(row)),
+  onClick: (e: MouseEvent) => {
+    // 勾选框点击不触发行为（进入目录/打开详情），否则冒泡会换目录并清空选择
+    const target = e.target as HTMLElement | null;
+    if (target?.closest(".n-checkbox")) return;
+    row.isDir ? store.enterDir(row.key) : store.selectObject(row);
+  },
   onContextmenu: (e: MouseEvent) => openObjectMenu(e, row),
+});
+
+// ---- 批量选择与批量删除（OBJ-10）----
+const checkedKeys = ref<string[]>([]);
+
+// 换目录/换桶时清空选择
+watch(
+  () => [store.currentBucket, store.prefix],
+  () => {
+    checkedKeys.value = [];
+  },
+);
+
+const batchDeleting = ref(false);
+
+async function batchDelete() {
+  const keys = checkedKeys.value;
+  if (keys.length === 0 || !store.activeId || !store.currentBucket) return;
+  const ok = await ask(
+    `确定删除选中的 ${keys.length} 项？文件夹会连同其中全部对象一起删除，且不可撤销。`,
+    { title: "批量删除", kind: "warning" },
+  );
+  if (!ok) return;
+
+  batchDeleting.value = true;
+  try {
+    const r = unwrap(
+      await commands.deleteObjectsBatch(store.activeId, store.currentBucket, keys),
+    );
+    if (r.errors.length === 0) {
+      message.success(`已删除 ${r.deleted} 个对象`);
+    } else {
+      message.warning(`部分删除失败：${r.errors.length} 项`);
+      uploadHint.value = r.errors.slice(0, 5).join("；");
+    }
+    checkedKeys.value = [];
+    store.clearSelection();
+    await store.reloadObjects();
+  } catch (e) {
+    message.error(errText(e));
+  } finally {
+    batchDeleting.value = false;
+  }
+}
+
+/** Ctrl+A 全选已加载条目（输入框内不劫持）。 */
+function onKeydown(e: KeyboardEvent) {
+  if (!store.currentBucket || !e.ctrlKey || e.key.toLowerCase() !== "a") return;
+  const target = e.target as HTMLElement | null;
+  if (target && ["INPUT", "TEXTAREA"].includes(target.tagName)) return;
+  e.preventDefault();
+  checkedKeys.value = store.objects.map((o) => o.key);
+}
+
+onMounted(() => window.addEventListener("keydown", onKeydown));
+onUnmounted(() => window.removeEventListener("keydown", onKeydown));
+
+// 有任务完成时自动刷新对象列表（上传新对象 / 目录出现）
+watch(
+  () => transfers.finishedCount,
+  () => {
+    if (store.currentBucket) void store.reloadObjects();
+  },
+);
+
+// ---- 前缀内搜索（客户端过滤已加载条目）----
+const objectKeyword = ref("");
+
+const filteredObjects = computed(() => {
+  const k = objectKeyword.value.trim().toLowerCase();
+  if (!k) return store.objects;
+  return store.objects.filter((o) => o.name.toLowerCase().includes(k));
+});
+
+// ---- 新建文件夹（占位前缀，OBJ-13）----
+const newFolderVisible = ref(false);
+const newFolderCreating = ref(false);
+
+async function submitNewFolder(name: string) {
+  if (!store.activeId || !store.currentBucket) return;
+  newFolderCreating.value = true;
+  try {
+    unwrap(
+      await commands.createPrefix(store.activeId, store.currentBucket, store.prefix, name),
+    );
+    message.success(`文件夹 ${name} 已创建`);
+    newFolderVisible.value = false;
+    await store.reloadObjects();
+  } catch (e) {
+    message.error(errText(e));
+  } finally {
+    newFolderCreating.value = false;
+  }
+}
+
+// ---- 拖拽上传（Webview 级 drag-drop 事件携带本地路径）----
+const dragOver = ref(false);
+let unlistenDrag: (() => void) | null = null;
+
+onMounted(async () => {
+  unlistenDrag = await getCurrentWebview().onDragDropEvent((event) => {
+    if (event.payload.type === "enter" || event.payload.type === "over") {
+      if (store.currentBucket) dragOver.value = true;
+    } else if (event.payload.type === "leave") {
+      dragOver.value = false;
+    } else if (event.payload.type === "drop") {
+      dragOver.value = false;
+      const paths = event.payload.paths ?? [];
+      if (paths.length > 0 && store.currentBucket) void runUpload(paths, "拖拽内容");
+    }
+  });
+});
+
+onUnmounted(() => {
+  unlistenDrag?.();
 });
 
 /** 前缀面包屑分段（累计前缀可点击回跳）。 */
@@ -363,35 +497,15 @@ async function goUp() {
   await store.goToPrefix(parent);
 }
 
-// ---- 上传（文件 / 文件夹，均在 Rust 侧流式读写）----
+// ---- 上传（入传输队列：分片上传 / 断点续传 / 进度见传输面板）----
 async function runUpload(paths: string[], kindLabel: string) {
   if (!store.activeId || !store.currentBucket || paths.length === 0) return;
-  uploading.value = true;
   uploadHint.value = null;
   try {
-    const summary = unwrap(
-      await commands.uploadPaths(
-        store.activeId,
-        store.currentBucket,
-        store.prefix,
-        paths,
-      ),
-    );
-    if (summary.failed === 0) {
-      message.success(
-        `${kindLabel}上传完成：${summary.uploaded} 个文件，${formatSize(summary.totalBytes)}`,
-      );
-    } else {
-      message.warning(
-        `上传完成：成功 ${summary.uploaded} 个，失败 ${summary.failed} 个`,
-      );
-      uploadHint.value = summary.errors.slice(0, 5).join("；");
-    }
-    await store.reloadObjects();
+    const infos = await transfers.startUpload(paths);
+    message.success(`${kindLabel}已加入传输队列：${infos.length} 个文件`);
   } catch (e) {
     message.error(errText(e));
-  } finally {
-    uploading.value = false;
   }
 }
 
@@ -493,13 +607,43 @@ async function uploadFolder() {
       </div>
 
       <div class="page-tools">
-        <NButton size="small" :loading="uploading" @click="uploadFiles()">
+        <NInput
+          v-model:value="objectKeyword"
+          size="small"
+          placeholder="搜索当前目录"
+          clearable
+          style="width: 170px"
+        >
+          <template #prefix>
+            <NIcon size="13" color="#909399"><SearchOutline /></NIcon>
+          </template>
+        </NInput>
+        <NButton
+          v-if="checkedKeys.length > 0"
+          size="small"
+          type="error"
+          secondary
+          :loading="batchDeleting"
+          @click="batchDelete()"
+        >
+          <template #icon>
+            <NIcon><TrashOutline /></NIcon>
+          </template>
+          删除选中（{{ checkedKeys.length }}）
+        </NButton>
+        <NButton size="small" @click="newFolderVisible = true">
+          <template #icon>
+            <NIcon><FolderOutline /></NIcon>
+          </template>
+          新建文件夹
+        </NButton>
+        <NButton size="small" @click="uploadFiles()">
           <template #icon>
             <NIcon><CloudUploadOutline /></NIcon>
           </template>
           上传文件
         </NButton>
-        <NButton size="small" :loading="uploading" @click="uploadFolder()">
+        <NButton size="small" @click="uploadFolder()">
           <template #icon>
             <NIcon><FolderOutline /></NIcon>
           </template>
@@ -521,16 +665,24 @@ async function uploadFolder() {
     </div>
 
     <div class="content-row">
-      <div class="table-wrap">
+      <div class="table-wrap" style="position: relative">
         <NDataTable
           :columns="objectColumns"
-          :data="store.objects"
+          :data="filteredObjects"
           :loading="store.objectsLoading"
           :row-props="objectRowProps"
+          :row-key="(row: ObjectEntry) => row.key"
+          v-model:checked-row-keys="checkedKeys"
           :flex-height="true"
           :virtual-scroll="true"
           style="height: 100%"
         />
+        <div v-if="dragOver" class="drop-mask">
+          <div class="drop-box">
+            <NIcon :size="36" color="#18a058"><CloudUploadOutline /></NIcon>
+            <div>松开鼠标上传到当前目录</div>
+          </div>
+        </div>
       </div>
       <ObjectDetailPanel
         v-if="store.selected"
@@ -541,7 +693,7 @@ async function uploadFolder() {
 
     <div class="page-foot">
       <span class="page-count-info">
-        共 {{ store.objects.length }} 项{{ store.nextToken ? "，未加载完" : "" }}
+        共 {{ filteredObjects.length }} 项{{ store.nextToken ? "，未加载完" : "" }}{{ objectKeyword ? `（筛选自 ${store.objects.length} 项）` : "" }}
         <template v-if="uploadHint">
           <NText type="warning" style="font-size: 12px"> · {{ uploadHint }}</NText>
         </template>
@@ -590,6 +742,18 @@ async function uploadFolder() {
     confirm-text="重命名"
     :loading="renaming"
     @submit="submitRenameDir"
+  />
+
+  <PromptModal
+    v-model:visible="newFolderVisible"
+    title="新建文件夹"
+    label="文件夹名"
+    :initial="''"
+    placeholder="例如 photos"
+    hint="S3 中目录只是公共前缀：这里会写入一个以 / 结尾的占位对象。"
+    confirm-text="创建"
+    :loading="newFolderCreating"
+    @submit="submitNewFolder"
   />
 </template>
 
@@ -731,5 +895,31 @@ async function uploadFolder() {
 
 :deep(.row-active) {
   background: #eef6ff !important;
+}
+
+.drop-mask {
+  position: absolute;
+  inset: 0;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(24, 160, 88, 0.06);
+  border-radius: 8px;
+}
+
+.drop-box {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  padding: 24px 40px;
+  border: 2px dashed #18a058;
+  border-radius: 12px;
+  background: #ffffff;
+  color: #18a058;
+  font-size: 14px;
+  font-weight: 500;
+  pointer-events: none;
 }
 </style>

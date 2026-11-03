@@ -26,6 +26,7 @@ specta-typescript = { workspace = true }
 tauri-specta = { workspace = true }
 s3warden-core = { workspace = true }
 s3warden-admin = { workspace = true }
+uuid = { workspace = true }
 
 [[bin]]
 name = "export-bindings"

@@ -20,7 +20,9 @@ export class IpcError extends Error {
   readonly kind: AppError["kind"];
 
   constructor(readonly detail: AppError) {
-    super(detail.message);
+    // 单元变体（如 cancelled）序列化后不含 message 字段
+    const msg = (detail as { message?: string }).message ?? "操作已取消";
+    super(msg);
     this.name = "IpcError";
     this.kind = detail.kind;
   }

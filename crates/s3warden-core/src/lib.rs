@@ -13,6 +13,7 @@ pub mod error;
 pub mod probe;
 pub mod s3;
 pub mod secrets;
+pub mod transfer;
 pub mod types;
 
 pub use error::{AppError, AppResult};
