@@ -1,0 +1,11 @@
+[package]
+name = "s3warden-admin"
+description = "S3Warden 管理 API 适配层：统一抽象 MinIO / RustFS 的管理能力差异"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+s3warden-core = { workspace = true }

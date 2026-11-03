@@ -1,0 +1,12 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "主窗口最小权限：核心默认权限 + 文件选择对话框 + 打开所在目录。未授予 shell / fs 等宽泛权限（开发文档 6.6）。",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "dialog:default",
+    "dialog:allow-ask",
+    "opener:default"
+  ]
+}

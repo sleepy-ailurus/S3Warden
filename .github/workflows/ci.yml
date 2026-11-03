@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  web:
+    name: 前端（typecheck + build）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: |
+            pnpm-lock.yaml
+            web/pnpm-lock.yaml
+
+      - name: 安装依赖
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm -C web install --frozen-lockfile
+
+      - name: 类型检查
+        run: pnpm -C web typecheck
+
+      - name: 构建
+        run: pnpm -C web build
+
+  rust:
+    name: Rust（fmt + clippy + test + 绑定漂移检查）
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: 准备 frontendDist 占位（tauri 编译需要）
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force web/dist | Out-Null
+          Set-Content web/dist/index.html "<!doctype html><title>placeholder</title>"
+
+      - name: 格式检查
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: 测试
+        run: cargo test --workspace
+
+      - name: 导出 TypeScript 绑定
+        run: cargo run -p s3warden --bin export-bindings
+
+      - name: 绑定漂移检查（IPC-04）
+        shell: bash
+        run: git diff --exit-code -- web/src/bindings.ts

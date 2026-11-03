@@ -1,0 +1,52 @@
+[workspace]
+resolver = "2"
+members = ["crates/s3warden-core", "crates/s3warden-admin", "src-tauri"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/sleepy-ailurus/S3Warden"
+authors = ["sleepy-ailurus"]
+
+[workspace.dependencies]
+# 序列化与错误
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+
+# 异步运行时（fs / io-util 供大文件本地读写使用）
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "fs", "io-util"] }
+
+# IPC 类型绑定（版本必须精确钉死，见 tauri-specta 文档要求）
+specta = { version = "=2.0.0-rc.26", features = ["derive"] }
+specta-typescript = "0.0.13"
+tauri-specta = { version = "=2.0.0-rc.26", features = ["derive", "typescript"] }
+
+# 桌面壳
+tauri = "2"
+tauri-build = "2"
+
+# 官方插件：系统文件/目录选择对话框、用系统默认程序打开路径
+tauri-plugin-dialog = "2"
+tauri-plugin-opener = "2"
+
+# S3 客户端与探测
+aws-sdk-s3 = "1"
+aws-smithy-types = "1"
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "webpki-roots"] }
+
+# 本地能力
+keyring = { version = "4", features = ["v1"] }
+dirs = "7"
+uuid = { version = "1", features = ["v4"] }
+time = { version = "0.3", features = ["formatting"] }
+
+# 内部 crate
+s3warden-core = { path = "crates/s3warden-core" }
+s3warden-admin = { path = "crates/s3warden-admin" }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

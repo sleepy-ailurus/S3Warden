@@ -1,0 +1,22 @@
+[package]
+name = "s3warden-core"
+description = "S3Warden 核心库：S3 操作、连接管理、密钥存储、后端探测与能力模型"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+specta = { workspace = true }
+aws-sdk-s3 = { workspace = true }
+aws-smithy-types = { workspace = true }
+reqwest = { workspace = true }
+keyring = { workspace = true }
+dirs = { workspace = true }
+uuid = { workspace = true }
+time = { workspace = true }

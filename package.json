@@ -1,0 +1,17 @@
+{
+  "name": "s3warden",
+  "private": true,
+  "version": "0.1.0",
+  "packageManager": "pnpm@12.11.2",
+  "scripts": {
+    "tauri": "tauri",
+    "dev": "tauri dev",
+    "build": "tauri build",
+    "web:dev": "pnpm -C web dev",
+    "web:build": "pnpm -C web build",
+    "web:typecheck": "pnpm -C web typecheck"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.0.0"
+  }
+}
